@@ -34,6 +34,8 @@ jobs:
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST
+    permissions:
+      contents: write   # paper-trading step saves its encrypted ledger to the paper-ledger branch
     # 添加超时限制，防止任务卡死
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
@@ -43,6 +45,8 @@ jobs:
       
       - name: 检出代码
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false   # only the paper-trading step pushes, with its own token
       
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
@@ -564,6 +568,27 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
       
+      - name: Paper trading ledger (demo money)
+        # Skips itself when the PAPER_LEDGER_KEY secret is not set. See docs/paper-trading.md.
+        # A failure here never fails the daily analysis job.
+        continue-on-error: true
+        env:
+          PAPER_LEDGER_KEY: ${{ secrets.PAPER_LEDGER_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          PAPER_START_CASH: ${{ vars.PAPER_START_CASH }}
+          PAPER_WEIGHTS: ${{ vars.PAPER_WEIGHTS }}
+          PAPER_BENCHMARK: ${{ vars.PAPER_BENCHMARK }}
+          PAPER_FX_FEE: ${{ vars.PAPER_FX_FEE }}
+          PAPER_CASH_INTEREST: ${{ vars.PAPER_CASH_INTEREST }}
+          PAPER_UK_FRACTIONAL: ${{ vars.PAPER_UK_FRACTIONAL }}
+          PAPER_PLATFORM: ${{ vars.PAPER_PLATFORM }}
+          PAPER_DASHBOARD: ${{ vars.PAPER_DASHBOARD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+        run: ./scripts/paper_trade_run.sh
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
