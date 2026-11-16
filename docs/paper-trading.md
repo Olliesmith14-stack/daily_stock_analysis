@@ -64,7 +64,8 @@ For Freetrade's free plan instead: `PAPER_PLATFORM=Freetrade Basic`,
 - A dashboard file (HTML, opens in your phone's browser) every Friday and
   after manual runs: value over time, how often the calls were right five
   trading days later, holdings, each stock's price and latest call, and what
-  happened after each call. `PAPER_DASHBOARD` = `weekly` (default), `always`
+  happened after each call. Tap any stock for its own chart, call history,
+  trades and dividends. `PAPER_DASHBOARD` = `weekly` (default), `always`
   or `never`.
 
 Nothing about holdings or values is written to the public Actions log.

@@ -211,11 +211,14 @@ class MarketData:
 
         t = yf.Ticker(sym)
         currency = t.fast_info.get("currency") or ("GBp" if sym.endswith(".L") else "USD")
+        etf, name = False, None
         try:
-            etf = (t.info or {}).get("quoteType") == "ETF"
+            info = t.info or {}
+            etf = info.get("quoteType") == "ETF"
+            name = info.get("shortName") or info.get("longName")
         except Exception:
-            etf = False
-        return {"currency": currency, "etf": etf}
+            pass
+        return {"currency": currency, "etf": etf, "name": name}
 
 
 def on_or_before(series: Dict[str, float], d: str) -> Optional[Tuple[str, float]]:
@@ -531,7 +534,7 @@ def queue_orders(state, cfg: Config, signals: List[Signal], today: str) -> List[
 
 def ensure_meta(state, md: MarketData, symbols: List[str]):
     for sym in symbols:
-        if sym not in state["meta"]:
+        if sym not in state["meta"] or "name" not in state["meta"][sym]:
             state["meta"][sym] = md.meta(sym)
 
 
@@ -584,6 +587,131 @@ def summary(state, cfg: Config, trades, fill_date, status, queued: List[Signal],
     elif state["pending"] and state["pending"].get("init"):
         out.append(f"\nStarting with {gbp(cfg.start_cash)} cash. First prices are recorded at today's close.")
     return "\n".join(out)
+
+
+DASH_CSS = """
+.tap{cursor:pointer;-webkit-tap-highlight-color:transparent}
+.tap:hover .sym{color:#fff}
+.tap:focus-visible{outline:1px solid var(--cobalt);outline-offset:2px;border-radius:6px}
+#sheet{position:fixed;inset:0;display:none;z-index:10}
+#sheet.open{display:block}
+#sheet .back{position:absolute;inset:0;background:rgba(10,10,16,.72)}
+#sheet .panel{position:absolute;left:0;right:0;bottom:0;max-height:92vh;overflow-y:auto;background:var(--bg);
+border-radius:20px 20px 0 0;border-top:1px solid var(--line);padding:20px 16px 44px;max-width:760px;margin:0 auto}
+.shead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.sname{font-size:22px;font-weight:500;line-height:1.2}
+.x{background:var(--raised);color:var(--ivory);border:0;border-radius:40px;padding:8px 16px;font:inherit;
+font-size:14px;cursor:pointer}
+.sprice{font-size:34px;font-weight:500;line-height:1.1;margin:14px 0 4px}
+.pos{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0 6px}
+.pos .score{padding:12px}.pos .sval{font-size:17px}
+.h3{font-size:15px;font-weight:500;margin:24px 0 4px}
+.crow{display:grid;grid-template-columns:54px 1fr 76px 72px;gap:10px;align-items:center;padding:10px 0;
+border-top:1px solid var(--line)}
+.scrub{min-height:20px;font-size:13px;color:var(--ash);margin-top:12px}
+.dchart{width:100%;height:auto;display:block;touch-action:pan-y}
+.dchart text{fill:var(--slate);font-size:11px}
+.key{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--ash);margin-top:8px}
+.key i{display:inline-block;width:9px;height:9px;border-radius:9px;margin-right:6px;vertical-align:middle}
+.key i.b{background:var(--cobalt)}.key i.s{border:2px solid var(--ivory)}
+@media (max-width:520px){.pos{grid-template-columns:1fr 1fr}.crow{grid-template-columns:48px 1fr 70px 64px}}
+@media (min-width:800px){#sheet .panel{top:5vh;bottom:auto;border-radius:20px;border:1px solid var(--line);
+padding:28px 28px 36px}}
+"""
+
+DASH_JS = r"""
+(function(){
+var D=JSON.parse(document.getElementById('pp-data').textContent);
+var sheet=document.getElementById('sheet'),body=document.getElementById('sheet-body');
+var W=420,H=230,L=50,R=10,T=12,B=24;
+function money(v){var big=Math.abs(v)>=1000;
+ return '£'+v.toLocaleString('en-GB',{minimumFractionDigits:big?0:2,maximumFractionDigits:big?0:2});}
+function fmtD(s){return new Date(s+'T00:00:00Z').toLocaleDateString('en-GB',
+ {day:'numeric',month:'short',timeZone:'UTC'});}
+function pct(a,b){if(!a||!b)return '<span class="muted">—</span>';var v=(a/b-1)*100;
+ return '<span class="'+(v>=0?'up':'down')+'">'+(v>=0?'▲':'▼')+' '+Math.abs(v).toFixed(1)+'%</span>';}
+var CH={buy:['Buy','chip-buy'],reduce:['Reduce','chip-sell'],sell:['Sell','chip-sell'],hold:['Watch','chip-hold']};
+function chip(a){var c=CH[a]||[a,'chip-hold'];return '<span class="chip '+c[1]+'">'+c[0]+'</span>';}
+function qty(q){return (+q.toPrecision(4)).toLocaleString('en-GB');}
+function stat(l,v){return '<div class="score"><div class="cap">'+l+'</div><div class="sval">'+v+'</div></div>';}
+function chart(s){
+ var p=s.px;if(p.length<2)return '<p class="muted small">The chart appears after two trading days.</p>';
+ var lo=Infinity,hi=-Infinity,i;
+ for(i=0;i<p.length;i++){lo=Math.min(lo,p[i][1]);hi=Math.max(hi,p[i][1]);}
+ var pad=(hi-lo)*0.14||hi*0.02||1;lo-=pad;hi+=pad;
+ function x(k){return L+(W-L-R)*k/(p.length-1);}
+ function y(v){return T+(H-T-B)*(1-(v-lo)/(hi-lo));}
+ var o='<svg class="dchart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Price since the start">';
+ for(i=0;i<3;i++){var v=lo+(hi-lo)*(i+0.5)/3;
+  o+='<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'" class="grid"/>';
+  o+='<text x="'+(L-8)+'" y="'+(y(v)+4).toFixed(1)+'" text-anchor="end">'+money(v)+'</text>';}
+ o+='<text x="'+L+'" y="'+(H-6)+'">'+fmtD(p[0][0])+'</text>';
+ o+='<text x="'+(W-R)+'" y="'+(H-6)+'" text-anchor="end">'+fmtD(p[p.length-1][0])+'</text>';
+ var pts='';for(i=0;i<p.length;i++)pts+=x(i).toFixed(1)+','+y(p[i][1]).toFixed(1)+' ';
+ o+='<polygon points="'+L+','+(H-B)+' '+pts+(W-R)+','+(H-B)+'" fill="#5266eb" opacity="0.10"/>';
+ o+='<polyline points="'+pts+'" fill="none" stroke="#ededf3" stroke-width="2" stroke-linejoin="round"/>';
+ s.calls.forEach(function(c){
+  if(c.a==='hold'||c.pending)return;var k=-1;
+  for(var j=0;j<p.length;j++){if(p[j][0]<=c.d)k=j;}
+  if(k<0)return;var cx=x(k).toFixed(1),cy=y(p[k][1]).toFixed(1);
+  o+=c.a==='buy'?'<circle cx="'+cx+'" cy="'+cy+'" r="4.5" fill="#5266eb" stroke="#171721" stroke-width="1.5"/>'
+   :'<circle cx="'+cx+'" cy="'+cy+'" r="4" fill="#171721" stroke="#ededf3" stroke-width="2"/>';});
+ o+='<line class="sl" y1="'+T+'" y2="'+(H-B)+'" stroke="#70707d" stroke-width="1" visibility="hidden"/>';
+ o+='<circle class="sc" r="4" fill="#ededf3" visibility="hidden"/></svg>';
+ o+='<div class="key"><span><i class="b"></i>Buy call</span><span><i class="s"></i>Reduce or Sell call</span></div>';
+ return o;}
+function open(sym){
+ var s=D[sym];if(!s)return;var p=s.px,last=p.length?p[p.length-1]:null,h='';
+ h+='<div class="shead"><div><div class="cap">'+sym+'</div><div class="sname">'+(s.name||sym)+'</div></div>';
+ h+='<button class="x" type="button" data-close="1">Close</button></div>';
+ if(last){h+='<div class="sprice">'+money(last[1])+'</div><div class="small">'+pct(last[1],p[0][1]);
+  h+=' <span class="muted">since '+fmtD(p[0][0])+' · close on '+fmtD(last[0])+'</span></div>';}
+ else h+='<p class="muted">Prices appear after the first run settles.</p>';
+ if(s.qty>0){h+='<div class="pos">'+stat('Shares',qty(s.qty))+stat('Value',money(s.value))
+  +stat('Paid',money(s.cost))+stat('Gain',pct(s.value,s.cost))+'</div>';}
+ else h+='<p class="muted small" style="margin:14px 0 0">Not held right now.</p>';
+ h+='<div class="scrub" id="scrub">'+(p.length>1?'Touch the chart to see the price on any day.':'')+'</div>';
+ h+=chart(s);
+ h+='<div class="h3">Calls</div>';
+ var cs=s.calls.slice().reverse().slice(0,30);
+ if(!cs.length)h+='<p class="muted small">No calls recorded yet.</p>';
+ cs.forEach(function(c){h+='<div class="crow"><div class="muted small">'+fmtD(c.d)+'</div><div>'+chip(c.a)
+  +' <span class="muted small">'+(c.s==null?'':c.s)+'</span></div><div class="num small">'
+  +(c.p?money(c.p):'<span class="muted">at close</span>')+'</div><div class="num small">'
+  +(c.p&&last?pct(last[1],c.p):'')+'</div></div>';});
+ h+='<div class="h3">Your trades</div>';
+ if(!s.trades.length)h+='<p class="muted small">None yet.</p>';
+ s.trades.slice().reverse().forEach(function(t){h+='<div class="crow"><div class="muted small">'+fmtD(t.d)
+  +'</div><div class="small">'+(t.side==='BUY'?'Bought ':'Sold ')+qty(t.q)+'</div><div class="num small">'
+  +money(t.v)+'</div><div class="num small muted">fee '+money(t.fee)+'</div></div>';});
+ if(s.divs.length){h+='<div class="h3">Dividends</div>';
+  s.divs.slice().reverse().forEach(function(d){h+='<div class="crow"><div class="muted small">'+fmtD(d.d)
+   +'</div><div class="small">Paid to cash</div><div></div><div class="num small">'+money(d.amt)+'</div></div>';});}
+ h+='<div class="foot">Prices are daily closes in pounds, updated after each run. Not live.</div>';
+ body.innerHTML=h;sheet.classList.add('open');document.body.style.overflow='hidden';
+ sheet.querySelector('.panel').scrollTop=0;
+ var svg=body.querySelector('.dchart');
+ if(svg){var sl=svg.querySelector('.sl'),sc=svg.querySelector('.sc'),out=document.getElementById('scrub');
+  var lo=Infinity,hi=-Infinity;p.forEach(function(q){lo=Math.min(lo,q[1]);hi=Math.max(hi,q[1]);});
+  var pad=(hi-lo)*0.14||hi*0.02||1;lo-=pad;hi+=pad;
+  var mv=function(e){var r=svg.getBoundingClientRect(),fx=(e.clientX-r.left)/r.width*W;
+   var k=Math.round((fx-L)/(W-L-R)*(p.length-1));k=Math.max(0,Math.min(p.length-1,k));
+   var cx=L+(W-L-R)*k/(p.length-1),cy=T+(H-T-B)*(1-(p[k][1]-lo)/(hi-lo));
+   sl.setAttribute('x1',cx);sl.setAttribute('x2',cx);sl.setAttribute('visibility','visible');
+   sc.setAttribute('cx',cx);sc.setAttribute('cy',cy);sc.setAttribute('visibility','visible');
+   out.textContent=fmtD(p[k][0])+' · '+money(p[k][1]);};
+  svg.addEventListener('pointermove',mv);svg.addEventListener('pointerdown',mv);}
+}
+function close(){sheet.classList.remove('open');document.body.style.overflow='';}
+document.addEventListener('click',function(e){
+ if(e.target.closest('[data-close]')){close();return;}
+ var el=e.target.closest('[data-sym]');if(el)open(el.getAttribute('data-sym'));});
+document.addEventListener('keydown',function(e){
+ if(e.key==='Escape')close();
+ if(e.key==='Enter'&&e.target.getAttribute&&e.target.getAttribute('data-sym'))open(e.target.getAttribute('data-sym'));});
+var hs=decodeURIComponent(location.hash.slice(1));if(D[hs])open(hs);
+})();
+"""
 
 
 def _fmt_d(d: str) -> str:
@@ -737,7 +865,8 @@ def dashboard_html(state, cfg: Config) -> str:
         w = val / v["followed"] * 100 if v["followed"] else 0
         lc = latest_call.get(sym)
         hold_rows.append(
-            f"<div class='row'><div class='sym'>{sym}<div class='muted small'>{q:,.4g} shares</div></div>"
+            f"<div class='row tap' data-sym='{sym}' role='button' tabindex='0'>"
+            f"<div class='sym'>{sym}<div class='muted small'>{q:,.4g} shares</div></div>"
             f"<div class='bar'><span style='width:{min(w * 2.5, 100):.0f}%'></span>"
             f"<div class='muted small'>{w:.1f}% of portfolio</div></div>"
             f"<div class='num'>{gbp(val)}<div class='small'>{_pct_html(_chg(val, f['cost'].get(sym, 0)))}</div></div>"
@@ -758,7 +887,8 @@ def dashboard_html(state, cfg: Config) -> str:
         chip = _chip(lc["action"], f"{CHIP.get(lc['action'], ('', ''))[0]} {lc['score'] if lc['score'] is not None else ''}".strip()) if lc else ""
         held = "<span class='dot' title='Held'></span>" if sym in f["holdings"] else ""
         watch_rows.append(
-            f"<div class='wrow'><div class='sym'>{held}{sym}</div>{sparkline(series)}"
+            f"<div class='wrow tap' data-sym='{sym}' role='button' tabindex='0'>"
+            f"<div class='sym'>{held}{sym}</div>{sparkline(series)}"
             f"<div class='num small'>{_pct_html(_chg(series[-1], series[0]) if len(series) > 1 else None)}</div>"
             f"<div class='chipcol'>{chip}</div></div>")
 
@@ -768,17 +898,40 @@ def dashboard_html(state, cfg: Config) -> str:
         now_px = prices.get(c["symbol"])
         move = _chg(now_px, c["price"]) if now_px and c.get("price") else None
         timeline.append(
-            f"<div class='trow'><div class='muted small'>{_fmt_short(c['date'])}</div>"
+            f"<div class='trow tap' data-sym='{c['symbol']}' role='button' tabindex='0'>"
+            f"<div class='muted small'>{_fmt_short(c['date'])}</div>"
             f"<div class='sym'>{c['symbol']}</div><div>{_chip(c['action'])}"
             f" <span class='muted small'>{c['score'] if c['score'] is not None else ''}</span></div>"
             f"<div class='num small'>{gbp(c['price'])}</div><div class='num small'>{_pct_html(move)}</div></div>")
     timeline_html = "".join(timeline) or "<p class='muted'>No Buy, Reduce or Sell calls yet.</p>"
 
     trades = "".join(
-        f"<div class='trow'><div class='muted small'>{_fmt_short(t['date'])}</div><div class='sym'>{t['symbol']}</div>"
+        f"<div class='trow tap' data-sym='{t['symbol']}' role='button' tabindex='0'>"
+        f"<div class='muted small'>{_fmt_short(t['date'])}</div><div class='sym'>{t['symbol']}</div>"
         f"<div class='small'>{'Bought' if t['side'] == 'BUY' else 'Sold'} {t['qty']:,.4g}</div>"
         f"<div class='num small'>{gbp(t['value'])}</div><div class='num small muted'>fee {gbp(t['fee'])}</div></div>"
         for t in reversed(state["trades"][-20:])) or "<p class='muted'>No trades yet.</p>"
+
+    # Per-stock detail shown when a row is tapped.
+    meta = state.get("meta", {})
+    detail = {}
+    for sym in dict.fromkeys(list(universe) + list(f["holdings"]) + [c["symbol"] for c in calls]):
+        sym_calls = [{"d": c["date"], "a": c["action"], "s": c["score"], "p": c.get("price")}
+                     for c in calls if c["symbol"] == sym]
+        sym_calls += [{"d": pend["signal_date"], "a": c["action"], "s": c["score"], "p": None, "pending": True}
+                      for c in pend.get("calls", []) if c["symbol"] == sym]
+        q = f["holdings"].get(sym, 0.0)
+        detail[sym] = {
+            "name": (meta.get(sym) or {}).get("name") or "",
+            "px": [[d, closes[sym][d]] for d in sorted(closes.get(sym, {}))],
+            "calls": sym_calls,
+            "trades": [{"d": t["date"], "side": t["side"], "q": t["qty"], "v": t["value"], "fee": t["fee"]}
+                       for t in state["trades"] if t["symbol"] == sym],
+            "divs": [{"d": x["date"], "amt": x["amount"]} for x in state.get("dividend_log", [])
+                     if x["symbol"] == sym],
+            "qty": q, "value": round(q * prices.get(sym, 0.0), 2), "cost": round(f["cost"].get(sym, 0.0), 2),
+        }
+    payload = html.escape(json.dumps(detail, separators=(",", ":")), quote=False)
 
     started = _fmt_d(state["start_date"]) if state.get("start_date") else "today"
     return f"""<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8">
@@ -825,7 +978,7 @@ h2{{font-weight:500;font-size:19px;letter-spacing:.01em;margin:0 0 4px}}
 .stats{{grid-template-columns:1fr 1fr}}.row{{grid-template-columns:1fr 1fr 1fr}}.row .chipcol{{display:none}}
 .trow{{grid-template-columns:44px 1fr 1fr 60px}}.trow>:nth-child(4){{display:none}}
 .wrow{{grid-template-columns:1fr 1fr 64px 84px}}.card{{padding:18px}}}}
-</style></head><body><div class="wrap">
+{DASH_CSS}</style></head><body><div class="wrap">
 <div class="cap">Paper portfolio · demo money</div>
 <h1>{gbp(v['followed'])}</h1>
 <div class="lede">{_pct_html(ret_f)}<span class="muted small">since {started}</span>
@@ -838,7 +991,7 @@ h2{{font-weight:500;font-size:19px;letter-spacing:.01em;margin:0 0 4px}}
 <div class="card"><h2>How good are the calls?</h2><div class="sub">{score_note}</div>
 <div class="scores">{scorecard}</div></div>
 
-<div class="card"><h2>Holdings</h2><div class="sub">What the portfolio holds now</div>
+<div class="card"><h2>Holdings</h2><div class="sub">What the portfolio holds now · tap a stock for its chart, calls and trades</div>
 <div class='list'>{''.join(hold_rows)}</div></div>
 
 <div class="card"><h2>Your stocks</h2><div class="sub">Price since the start · latest call and score · <span class="dot"></span>held now</div>
@@ -858,7 +1011,12 @@ h2{{font-weight:500;font-size:19px;letter-spacing:.01em;margin:0 0 4px}}
 <div class="foot">Simulated with demo money using {html.escape(cfg.platform)} costs: {cfg.fx_fee * 100:.2f}% FX fee on non-GBP trades,
 {cfg.stamp_duty * 100:.1f}% stamp duty on UK share purchases, {cfg.cash_interest * 100:.2f}% interest on cash,
 US dividends net of {cfg.us_withholding * 100:.0f}% withholding. Not financial advice.</div>
-</div></body></html>"""
+</div>
+<div id="sheet" aria-hidden="true"><div class="back" data-close="1"></div>
+<div class="panel" role="dialog" aria-label="Stock detail"><div id="sheet-body"></div></div></div>
+<script type="application/json" id="pp-data">{payload}</script>
+<script>{DASH_JS}</script>
+</body></html>"""
 
 
 def send_dashboard(path: Path, caption: str) -> None:
