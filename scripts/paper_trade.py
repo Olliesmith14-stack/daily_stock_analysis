@@ -504,7 +504,7 @@ def settle(state, cfg: Config, md: MarketData, pend: dict, now: datetime) -> Tup
             qty = held / 2
         t = do_sell(port, o["symbol"], qty, price[o["symbol"]], costs)
         if t:
-            trades.append({**t, "reason": f"{o['advice'] or o['action']} ({o['score']})"})
+            trades.append({**t, "reason": f"{o['advice'] or o['action']}, score {o['score']}"})
 
     equity = port_value(port, price)
     buys = sorted([o for o in orders if o["action"] == "buy"], key=lambda o: -(o["score"] or 0))
@@ -514,7 +514,7 @@ def settle(state, cfg: Config, md: MarketData, pend: dict, now: datetime) -> Tup
         have = port["holdings"].get(sym, 0.0) * price[sym]
         t = do_buy(port, sym, max(target - have, 0.0), price[sym], costs)
         if t:
-            trades.append({**t, "reason": f"{o['advice'] or o['action']} ({o['score']})"})
+            trades.append({**t, "reason": f"{o['advice'] or o['action']}, score {o['score']}"})
 
     for t in trades:
         rounded = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in t.items()}
@@ -596,24 +596,25 @@ def pct(a: float, b: float) -> str:
 
 
 def summary(state, cfg: Config, trades, fill_date, status, queued: List[Signal], signals: List[Signal]) -> str:
-    out = [f"📒 *Paper portfolio* (demo money, {cfg.platform} costs)"]
+    # No brackets: the repo's Telegram sender escapes them and Telegram shows the backslashes.
+    out = [f"📒 *Paper portfolio* · demo money, {cfg.platform} costs"]
     if status == "filled":
         if trades:
             out.append(f"\nFilled at the {fill_date} close:")
             for t in trades:
                 q = f"{t['qty']:g}"
                 out.append(f"• {t['side']} {q} {t['symbol']} @ {gbp(t['price'])} = {gbp(t['value'])}"
-                           f" (fees {gbp(t['fee'])}) — {t['reason']}")
+                           f" · fees {gbp(t['fee'])} · {t['reason']}")
         else:
-            out.append(f"\nNo trades at the {fill_date} close (no Buy/Reduce/Sell calls to act on).")
+            out.append(f"\nNo trades at the {fill_date} close: no Buy, Reduce or Sell calls to act on.")
     elif status == "waiting":
         out.append("\nEarlier orders are waiting for their market's next close.")
 
     if signals:
         if queued:
-            out.append("\nToday's calls (each fills at its market's next close):")
+            out.append("\nToday's calls, each filled at its market's next close:")
             for s in queued:
-                out.append(f"• {s.symbol}: {s.advice or s.action} ({s.score}) → {s.action.upper()}")
+                out.append(f"• {s.symbol}: {s.advice or s.action}, score {s.score} → {s.action.upper()}")
         else:
             out.append("\nToday's calls: all Watch/Hold, no orders.")
 
@@ -624,7 +625,7 @@ def summary(state, cfg: Config, trades, fill_date, status, queued: List[Signal],
         start = cfg.start_cash
         f = state["followed"]
         out.append(f"\nValue {gbp(v['followed'])} · cash {gbp(f['cash'])} "
-                   f"({f['cash'] / v['followed'] * 100:.0f}%)")
+                   f"= {f['cash'] / v['followed'] * 100:.0f}% of the portfolio")
         out.append(f"Since {state['start_date']}: following calls {pct(v['followed'], start)} · "
                    f"your picks held {pct(v['held'], start)} · {cfg.benchmark} {pct(v['bench'], start)}")
         out.append(f"Fees {gbp(f['fees'])} · dividends {gbp(f['dividends'])} · "
