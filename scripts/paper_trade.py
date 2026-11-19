@@ -13,8 +13,9 @@ Comparing them answers two questions: did your picks beat the index
 (held vs bench), and did following the calls help (followed vs held)?
 
 Realism (defaults model a UK investor on Trading 212, in a stocks & shares ISA):
-  - Orders are filled at the close of the day the call was made, settled on
-    the next run, so no prices from after the call are ever used.
+  - Each order fills at its market's first close after the call was made
+    (London 16:30 UK time, New York 16:00 ET), so a price the analysis had
+    already seen is never used. Orders wait until that close is available.
   - 0.15% FX fee on every buy and sell of a non-GBP stock.
   - 0.5% stamp duty on buying UK shares (not ETFs).
   - Fractional shares (set PAPER_UK_FRACTIONAL=false for whole UK shares).
@@ -43,9 +44,10 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -150,8 +152,12 @@ def to_action(advice: Optional[str], score: Optional[int]) -> str:
     return "sell"
 
 
-def load_signals(lookback_hours: int) -> List[Signal]:
-    """Latest stock analysis per code saved in the last `lookback_hours`."""
+def load_signals(lookback_hours: int, allowed: Optional[set] = None) -> List[Signal]:
+    """Latest stock analysis per code saved in the last `lookback_hours`.
+
+    Only codes in `allowed` (the STOCK_LIST) are used when it is given, so the
+    market-review entry and anything else that is not one of your stocks is ignored.
+    """
     from src.storage import AnalysisHistory, get_db
 
     since = datetime.now() - timedelta(hours=lookback_hours)
@@ -167,7 +173,7 @@ def load_signals(lookback_hours: int) -> List[Signal]:
             if row.operation_advice is None and row.sentiment_score is None:
                 continue
             sym = norm_symbol(row.code)
-            if sym is None:
+            if sym is None or (allowed and sym not in allowed):
                 continue
             latest[sym] = Signal(sym, row.sentiment_score, row.operation_advice or "",
                                  to_action(row.operation_advice, row.sentiment_score))
@@ -210,7 +216,11 @@ class MarketData:
         import yfinance as yf
 
         t = yf.Ticker(sym)
-        currency = t.fast_info.get("currency") or ("GBp" if sym.endswith(".L") else "USD")
+        try:
+            currency = t.fast_info.get("currency")
+        except Exception:
+            currency = None
+        currency = currency or ("GBp" if sym.endswith(".L") else "USD")
         etf, name = False, None
         try:
             info = t.info or {}
@@ -402,7 +412,7 @@ def init_state(cfg: Config, today: str) -> dict:
         "held": new_port(cfg.start_cash),
         "bench": new_port(cfg.start_cash),
         "meta": {},
-        "pending": None,
+        "queue": [],
         "div_through": None,
         "interest_through": None,
         "closes": {},
@@ -413,30 +423,50 @@ def init_state(cfg: Config, today: str) -> dict:
     }
 
 
-def settle(state, cfg: Config, md: MarketData, today: str) -> Tuple[List[dict], Optional[str], str]:
-    """Fill the pending batch at the close of its signal day. Returns (trades, fill_date, status)."""
-    pend = state.get("pending")
-    if not pend:
-        return [], None, "none"
+CLOSE_TIMES = {"L": ("Europe/London", 16, 35)}
+DEFAULT_CLOSE = ("America/New_York", 16, 5)
+
+
+def close_instant(sym: str, d: str) -> datetime:
+    """When the closing price for `sym` on date `d` becomes final (with a few minutes' margin)."""
+    suffix = sym.rsplit(".", 1)[1] if "." in sym else ""
+    tz, h, m = CLOSE_TIMES.get(suffix, DEFAULT_CLOSE)
+    return datetime.combine(date.fromisoformat(d), time(h, m), ZoneInfo(tz))
+
+
+def execution_close(closes: Dict[str, float], sym: str, signal_ts: datetime,
+                    now: datetime) -> Optional[Tuple[str, float]]:
+    """First close after the call; None if it hasn't happened yet."""
+    for d in sorted(closes):
+        at = close_instant(sym, d)
+        if at > signal_ts:
+            return (d, closes[d]) if at <= now else None
+    return None
+
+
+def settle(state, cfg: Config, md: MarketData, pend: dict, now: datetime) -> Tuple[List[dict], Optional[str], str]:
+    """Fill one queued batch at each stock's first close after the call. Returns (trades, fill_date, status)."""
     sig_date = pend["signal_date"]
-    if sig_date >= today:
-        return [], None, "waiting"
+    signal_ts = datetime.fromisoformat(pend["signal_ts"])
+    stale = now - signal_ts > timedelta(days=7)
 
     pricer = Pricer(md, state["meta"], state["data_start"])
     costs = Costs(cfg, pricer)
-    # A ticker Yahoo has no data for at all is dropped rather than blocking every order.
-    universe = [s for s in pend["universe"] if md.closes(s, state["data_start"])]
-    if len(universe) < len(pend["universe"]):
-        logger.warning("%d ticker(s) have no price data and were skipped",
-                       len(pend["universe"]) - len(universe))
+    universe = [s for s in pend["universe"] if s in state["meta"]]
     needed = set(universe) | set(state["followed"]["holdings"]) | {cfg.benchmark}
 
     fills: Dict[str, Tuple[str, float]] = {}
     for sym in needed:
-        hit = first_on_or_after(md.closes(sym, state["data_start"]), sig_date, today)
-        if not hit:
-            return [], None, "no_price"
-        fills[sym] = (hit[0], pricer.to_gbp(sym, hit[1], hit[0]))
+        hit = execution_close(md.closes(sym, state["data_start"]), sym, signal_ts, now)
+        if hit:
+            fills[sym] = (hit[0], pricer.to_gbp(sym, hit[1], hit[0]))
+        elif not stale:
+            return [], None, "waiting"
+    if not fills:
+        return [], None, "waiting"
+    if stale and len(fills) < len(needed):
+        logger.warning("%d ticker(s) still had no price after a week and were skipped", len(needed) - len(fills))
+        universe = [s for s in universe if s in fills]
     fill_date = max(d for d, _ in fills.values())
     price = {s: p for s, (_, p) in fills.items()}
 
@@ -457,7 +487,8 @@ def settle(state, cfg: Config, md: MarketData, today: str) -> Tuple[List[dict], 
         state["start_date"] = sig_date
         for sym in universe:
             do_buy(state["held"], sym, cfg.start_cash * cfg.weight(sym) / total_w, price[sym], costs)
-        do_buy(state["bench"], cfg.benchmark, cfg.start_cash, price[cfg.benchmark], costs)
+        if cfg.benchmark in price:
+            do_buy(state["bench"], cfg.benchmark, cfg.start_cash, price[cfg.benchmark], costs)
 
     port = state["followed"]
     orders = [o for o in pend["orders"] if o["symbol"] in price]
@@ -488,7 +519,6 @@ def settle(state, cfg: Config, md: MarketData, today: str) -> Tuple[List[dict], 
     for t in trades:
         rounded = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in t.items()}
         state["trades"].append({"date": fills[t["symbol"]][0], **rounded})
-    state["pending"] = None
     return trades, fill_date, "filled"
 
 
@@ -517,25 +547,40 @@ def mark_to_market(state, cfg: Config, md: MarketData, today: str) -> Optional[s
     return last
 
 
-def queue_orders(state, cfg: Config, signals: List[Signal], today: str) -> List[Signal]:
+def queue_orders(state, cfg: Config, signals: List[Signal], today: str, now: datetime) -> List[Signal]:
+    """Queue today's calls. Re-running on the same day replaces that day's batch."""
     universe = list(dict.fromkeys((cfg.universe or []) + [s.symbol for s in signals]
                                   + list(state["followed"]["holdings"])))
-    state["pending"] = {
+    queue = state.setdefault("queue", [])
+    if queue and queue[-1]["signal_date"] == today:
+        queue.pop()
+    init = state["start_date"] is None and not any(b.get("init") for b in queue)
+    queue.append({
         "signal_date": today,
-        "init": state["start_date"] is None,
+        "signal_ts": now.isoformat(),
+        "init": init,
         "universe": universe,
         "orders": [{"symbol": s.symbol, "action": s.action, "advice": s.advice, "score": s.score}
                    for s in signals if s.action != "hold"],
         "calls": [{"symbol": s.symbol, "action": s.action, "advice": s.advice, "score": s.score}
                   for s in signals],
-    }
+    })
     return [s for s in signals if s.action != "hold"]
 
 
-def ensure_meta(state, md: MarketData, symbols: List[str]):
+def ensure_meta(state, md: MarketData, symbols: List[str]) -> List[str]:
+    """Load listing details; returns the symbols that have price data (others are skipped)."""
+    usable = []
     for sym in symbols:
-        if sym not in state["meta"] or "name" not in state["meta"][sym]:
-            state["meta"][sym] = md.meta(sym)
+        try:
+            if not md.closes(sym, state["data_start"]):
+                raise ValueError("no prices")
+            if sym not in state["meta"] or "name" not in state["meta"][sym]:
+                state["meta"][sym] = md.meta(sym)
+            usable.append(sym)
+        except Exception:
+            logger.warning("A ticker has no price data on Yahoo Finance and was skipped")
+    return usable
 
 
 # --------------------------------------------------------------------------
@@ -561,12 +606,12 @@ def summary(state, cfg: Config, trades, fill_date, status, queued: List[Signal],
                            f" (fees {gbp(t['fee'])}) — {t['reason']}")
         else:
             out.append(f"\nNo trades at the {fill_date} close (no Buy/Reduce/Sell calls to act on).")
-    elif status == "no_price":
-        out.append("\nYesterday's orders are still waiting for closing prices.")
+    elif status == "waiting":
+        out.append("\nEarlier orders are waiting for their market's next close.")
 
     if signals:
         if queued:
-            out.append("\nToday's calls (filled at today's close):")
+            out.append("\nToday's calls (each fills at its market's next close):")
             for s in queued:
                 out.append(f"• {s.symbol}: {s.advice or s.action} ({s.score}) → {s.action.upper()}")
         else:
@@ -584,7 +629,7 @@ def summary(state, cfg: Config, trades, fill_date, status, queued: List[Signal],
                    f"your picks held {pct(v['held'], start)} · {cfg.benchmark} {pct(v['bench'], start)}")
         out.append(f"Fees {gbp(f['fees'])} · dividends {gbp(f['dividends'])} · "
                    f"cash interest {gbp(f.get('interest', 0.0))}")
-    elif state["pending"] and state["pending"].get("init"):
+    elif any(b.get("init") for b in state.get("queue", [])):
         out.append(f"\nStarting with {gbp(cfg.start_cash)} cash. First prices are recorded at today's close.")
     return "\n".join(out)
 
@@ -827,7 +872,7 @@ def dashboard_html(state, cfg: Config) -> str:
     prices = state.get("last_prices", {})
     closes = state.get("closes", {})
     calls = state.get("calls", [])
-    pend = state.get("pending") or {}
+    pend = (state.get("queue") or [{}])[-1]
     latest_call: Dict[str, dict] = {c["symbol"]: c for c in calls}
     for c in pend.get("calls", []):
         latest_call[c["symbol"]] = {**c, "date": pend["signal_date"], "pending": True}
@@ -1000,7 +1045,7 @@ h2{{font-weight:500;font-size:19px;letter-spacing:.01em;margin:0 0 4px}}
 <div class="card"><h2>Calls and what happened next</h2><div class="sub">Price when called · change since</div>
 <div class='list'>{timeline_html}</div></div>
 
-<div class="card"><h2>Trades</h2><div class="sub">Filled at the close on the day of each call</div><div class='list'>{trades}</div></div>
+<div class="card"><h2>Trades</h2><div class="sub">Filled at each market's first close after the call</div><div class='list'>{trades}</div></div>
 
 <div class="card"><h2>Costs and income</h2><div class="stats" style="margin-top:12px">
 <div class="score"><div class="cap">Fees</div><div class="sval">{gbp(f['fees'])}</div></div>
@@ -1059,24 +1104,38 @@ def dashboard_due(today: str) -> bool:
 
 # --------------------------------------------------------------------------
 
-def run(cfg: Config, md: MarketData, signals: List[Signal], today: str) -> Tuple[dict, str]:
+def run(cfg: Config, md: MarketData, signals: List[Signal], today: str,
+        now: Optional[datetime] = None) -> Tuple[dict, str]:
+    now = now or datetime.combine(date.fromisoformat(today), time(18, 30), timezone.utc)
     if cfg.ledger_path.exists():
         state = json.loads(cfg.ledger_path.read_text())
     else:
         state = init_state(cfg, today)
+    queue = state.setdefault("queue", [])
+    if state.get("pending"):  # ledgers saved before the queue existed
+        queue.append(state.pop("pending"))
+        queue[-1].setdefault("signal_ts", datetime.combine(
+            date.fromisoformat(queue[-1]["signal_date"]), time(10), timezone.utc).isoformat())
 
-    ensure_meta(state, md, list(dict.fromkeys(
-        (cfg.universe or []) + [s.symbol for s in signals] + [cfg.benchmark] + list(state["followed"]["holdings"]))))
+    usable = set(ensure_meta(state, md, list(dict.fromkeys(
+        (cfg.universe or []) + [s.symbol for s in signals] + [cfg.benchmark]
+        + list(state["followed"]["holdings"])))))
+    signals = [s for s in signals if s.symbol in usable]
 
-    trades, fill_date, status = settle(state, cfg, md, today)
+    trades: List[dict] = []
+    fill_date, status = None, ("waiting" if queue else "none")
+    while queue:
+        t, fd, st = settle(state, cfg, md, queue[0], now)
+        if st != "filled":
+            break
+        queue.pop(0)
+        trades += t
+        fill_date, status = fd, "filled"
     mark_to_market(state, cfg, md, today)
 
     queued: List[Signal] = []
     if signals:
-        pend = state.get("pending")
-        if pend and status == "no_price":
-            logger.warning("Previous orders could not be priced; replacing them with today's calls")
-        queued = queue_orders(state, cfg, signals, today)
+        queued = queue_orders(state, cfg, signals, today, now)
 
     cfg.ledger_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cfg.ledger_path.with_suffix(".tmp")
@@ -1090,11 +1149,12 @@ def run(cfg: Config, md: MarketData, signals: List[Signal], today: str) -> Tuple
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     cfg = Config.from_env()
-    today = datetime.now(timezone.utc).date().isoformat()
-    signals = load_signals(cfg.lookback_hours)
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    signals = load_signals(cfg.lookback_hours, set(cfg.universe or []) | {cfg.benchmark} if cfg.universe else None)
     logger.info("%d analysis call(s) found", len(signals))
     try:
-        state, message = run(cfg, MarketData(), signals, today)
+        state, message = run(cfg, MarketData(), signals, today, now)
     except Exception as e:
         logger.error("Paper trading failed: %s", e)
         notify(f"📒 Paper portfolio update failed: {e}")
