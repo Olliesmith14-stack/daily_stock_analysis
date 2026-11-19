@@ -43,8 +43,10 @@ When cash is short, the highest-scoring Buy calls are filled first.
 
 Defaults model a UK investor using Trading 212 in a stocks and shares ISA:
 
-- Orders fill at the close on the day of the call, and are settled on the
-  next run, so no later prices are used.
+- Each order fills at its market's first close after the call (London
+  16:30 UK time, New York 16:00 ET), so a price the analysis had already
+  seen is never used. Orders wait in a queue until that close is available.
+- Only stocks in `STOCK_LIST` are traded; the market-review entry is ignored.
 - 0.15% FX fee on buying and selling non-GBP stocks (`PAPER_FX_FEE`).
 - 0.5% stamp duty on buying UK shares, not ETFs (`PAPER_STAMP_DUTY`).
 - Fractional shares. Set `PAPER_UK_FRACTIONAL=false` for whole UK shares.

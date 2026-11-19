@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 模拟盘账本忽略大盘复盘记录（MARKET），避免因无行情数据导致整步失败；成交改为各市场在建议生成后的首个收盘价，伦敦股票不再使用分析时已知的收盘价。
+
 - [改进] 模拟盘看板支持点击个股查看价格走势、历史建议、成交与股息明细（见 docs/paper-trading.md）。
 
 - [新功能] 新增可选的模拟盘账本 `scripts/paper_trade.py`：每日分析后按建议以英镑模拟交易（含汇率费、印花税、股息与预扣税），账本加密存于 `paper-ledger` 分支，并推送与基准的收益对比（见 docs/paper-trading.md）。
